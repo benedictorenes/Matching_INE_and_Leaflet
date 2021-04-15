@@ -1,0 +1,184 @@
+---
+title: "Choropleth with INE data"
+author: "Daniel Benedicto Orenes"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r lib}
+library(leaflet)
+library(rgdal)
+library(stringr)
+library(ggplot2)
+library(sp)
+library(viridis)
+library(htmltools)
+```
+
+# Creating an interactive Leaflet map using R and some official INE data (Spain)
+
+To plot geospatial data in R, I choose to use the package leaflet (ggplot and base plot in R also support these files, but they do not render interactive options). One needs two basic things:
+
+1. Data containing the shape of the map you want to plot. For this, there are several options (see packages **sp,sf**). We will use the **sp** package, that deals with *SpatialDataFrames* i.e. objects that are indicated by latitude and longitude coordinates. These can consist on points, lines, or polygones. We will use the polygones options. Each polygone is delimited by a series of lines, and they form a group. From the link below, we will use the spanish map shape file that contains the polygones of the Spanish "Provincias". Shape files for plotting the Spanish map: (http://centrodedescargas.cnig.es/CentroDescargas/catalogo.do?Serie=CAANE)
+
+2. Data to represent in the map, with a proper identifier between the corresponding polygones of the map and the values you want to represent. 
+
+## Leaflet Map
+
+First, let's load and plot a simple leaflet map of Spain. 
+
+```{r simple_map}
+shape_file_provincias = "SIANE_CARTO_BASE_S_10M/vigente"
+layer_provincias = "se89_10_admin_prov_a_x"
+provincias <- readOGR(dsn = shape_file_provincias, layer = layer_provincias)
+
+leaflet(provincias) %>% 
+        addPolygons(color = "#444444", weight = 1, opacity = 0.8, fillOpacity = 0.5) 
+```
+
+We can check what the **provincias** object looks like
+
+```{r sum}
+class(provincias)
+summary(provincias)
+```
+
+
+Now, let's add a *fake* column to the data set, in order to assign random colors to each polygon.
+
+```{r color_map}
+names = provincias$rotulo
+set.seed(123)
+rcol = abs(rnorm(length(names),0,4))
+
+# add the data to autonomias data frame
+provincias$col = rcol
+pal = colorNumeric(topo.colors(10, alpha = 0.7),rcol)
+
+# fill by autonomias
+leaflet(provincias) %>% 
+        addPolygons(color = "#444444",
+                    weight = 1, opacity = 0.8, fill = TRUE,
+                    fillColor = ~pal(col),
+                    fillOpacity = 0.5)
+
+```
+
+## Data from "padron"
+
+Now, I would like to load some data from the official spanish INE website (add link) that contains data grouped by *provincias*. For instance, we can check some data about population divided by *year*, *provincia* and *gender*. This data comes in a *.px* format. Let's load it. 
+
+```{r padron_data}
+library(pxR)
+datafile = "cifras_padron/DATOS/padron/l0/2852.px"
+data = read.px(datafile, encoding = "latin1")
+dp = as.data.frame(data)
+# dp is a data frame with 4 columns: Periodo (year), Sexo (gender), 
+# Provincias (location), and value (value of the observation). It contains
+# 3816 observations, and some 159 NA's which is about 4% of the data. 
+summary(dp)
+```
+
+Now, let's gather some data to plot. Let's say, we would like to plot,
+for the *provincia* of Barcelona, a time series of the population distributed by gender, and also a barplot of the total population by *provincia*, in 2015.
+
+```{r padron_plots}
+padronB = dp[grepl("08 Barcelona",dp$Provincias),]
+ggplot(padronB[padronB$Sexo %in% c("Hombres","Mujeres"),]) + 
+        geom_bar(aes(x = reorder(Periodo,as.numeric(as.character(Periodo)),decreasing = F), y=value, fill = Sexo),
+                           stat = "identity",position = position_dodge2()) +
+        theme(axis.text.x = element_text("",angle = 90),
+              axis.title.x = element_blank()) + 
+        ylab("poblacion")
+
+
+padrontot = dp[dp$Periodo=="2015" & dp$Sexo == "Total" & dp$Provincias != "Total",]
+ggplot(padrontot) + geom_bar(stat = "identity",
+                             aes(x = reorder(Provincias,value), y = value)) +
+        theme(axis.text.x = element_text("",angle = 90), axis.title.x = element_blank()) + 
+        ylab("poblacion")
+```
+
+## Matching geospatial data with leaflet plot
+
+Now, I would like to plot this data, representing the total population of each *provincia*, on a leaflet map, with a colors scale representing the value of the total population at each provincia.
+
+First we need to match the columns of both data sets. I will adapt the names in INE file to those of the leaflet map. So let's clean up the names in our **padron data frame**, and use the **is.element** function in R to do this. Another approach would be to do a merge using the option *by = identifier*.
+
+```{r clean_names}
+pn = padrontot$Provincias
+pnames = gsub("^.. ","",pn)
+sort(pnames)
+
+# check the match. First, we can observe that they do not have the same length
+# I have two more observations in padron than I have in the map. This is due to the 
+# canary islands are not included in the map
+length(names)
+length(pnames)
+
+# we have got 44 matches
+length(names[is.element(pnames,names)])
+# which are the values that do not match?
+pnames[!is.element(pnames,names)]
+
+# From these, Las Palmas y Santa cruz de tenerife we now they are not in the map
+# for the others, we need to convert the names in pnames to the corresponding ones in names
+
+# these are the problematic ones
+desirednames = names[is.na(charmatch(names,pnames))]
+# lets find out the indices in pnames that partially match these
+discolos = c("Castell", "Balears", "Alicant","Valencia","Rioja","Coruña")
+matchindexdisc = sapply(discolos,function(x) which(grepl(x,pnames)))
+
+# this works, now we got 50 matches
+pnames[matchindexdisc]=as.character(desirednames)
+length(names[is.element(pnames,names)])
+
+
+# Let's start subsetting the data frame to those that match before going further
+automatch = provincias[names[is.element(names,pnames)],]
+automatch$col = padrontot$value[names[is.element(names,pnames)]]
+automatch$lab = as.character(padrontot$value[names[is.element(names,pnames)]])
+```
+
+Now, we matched the two data frames, and we created a new column in the *map* data frame containing the population. I use a bit of *htmltools* to format the labels of the displaying map. 
+
+```{r leaflet_interactivity}
+labels <- sprintf(
+        "<strong>%s</strong><br/> Population: %s ",
+        automatch$rotulo, automatch$lab) %>% lapply(htmltools::HTML)
+
+# create a color palette matching the values of the population
+pal2 = colorNumeric(heat.colors(10),padrontot$value)
+
+# Interactivity with leaflet
+leaflet(automatch) %>% 
+        addPolygons(color = "#444444",
+                    weight = 1, opacity = 0.8, fill = TRUE,
+                    fillColor = ~pal2(col),
+                    fillOpacity = 0.5,
+                    highlight = highlightOptions(
+                            weight = 2,
+                            color = "red",
+                            bringToFront = TRUE),
+                    label = labels,
+                    labelOptions = labelOptions(style = list("font-weight" = "normal", 
+                                                padding = "8px 8px"),
+                                                textsize = "15px",direction = "auto")
+                    ) %>%
+        addLegend(pal = pal2, values = automatch$col, opacity = 0.7, title = "Population",
+                  position = "bottomleft")
+
+
+```
+
+
+
+
+
+
+
+
